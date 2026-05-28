@@ -144,19 +144,19 @@
           <div class="upload-icon">
             <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
           </div>
-          <div class="upload-title">Planilha do cliente</div>
+          <div class="upload-title">Planilha de pagamentos</div>
           <div class="upload-hint" id="hint-client">Clique ou arraste · .xls/.xlsx</div>
           <div class="file-tags" id="tags-client"></div>
         </div>
       </div>
       <div>
         <div class="upload-zone" id="zone-contas" onclick="document.getElementById('file-contas').click()">
-          <input type="file" id="file-contas" accept=".xlsx,.xls">
+          <input type="file" id="file-contas" accept=".xlsx,.xls,.csv">
           <div class="upload-icon">
             <svg viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
           </div>
           <div class="upload-title">Base de contas</div>
-          <div class="upload-hint" id="hint-contas">Clique para selecionar · .xlsx</div>
+          <div class="upload-hint" id="hint-contas">Clique para selecionar · .xlsx ou .csv</div>
           <div class="file-tags" id="tags-contas"></div>
         </div>
       </div>
@@ -309,17 +309,46 @@ function hideAll() {
 }
 
 function buildContaMap(rows) {
+  if (!rows || rows.length < 2) return {};
   const header = (rows[0] || []).map(v => v ? String(v).toLowerCase().trim() : '');
+
+  // Detecta formato CSV do sistema do cliente
+  const isSistema = header.some(h => h.includes('número da conta') || h === 'numero da conta' || h.includes('número da conta') || h === 'n\u00famero da conta');
+
+  if (isSistema) {
+    const cpfIdx = header.findIndex(h => h.includes('cpf'));
+    const contaIdx = header.findIndex(h => (h.includes('conta') && (h.includes('número') || h.includes('numero') || h.includes('número') || h.includes('n\u00famero'))) );
+    const statusIdx = header.findIndex(h => h.includes('paymentaccount') && !h.includes('criada'));
+    if (cpfIdx === -1 || contaIdx === -1) return { map: {}, inativas: [] };
+    const map = {};
+    const inativas = []; // { nome, cpf, conta }
+    const nomeIdx = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r[cpfIdx] || !r[contaIdx]) continue;
+      const cpf = parseCPF(r[cpfIdx]);
+      const conta = String(r[contaIdx]).trim();
+      const nome = r[nomeIdx] ? String(r[nomeIdx]).trim() : '';
+      const status = statusIdx >= 0 && r[statusIdx] ? String(r[statusIdx]).trim().toLowerCase() : 'aprovada';
+      map[cpf] = conta; // inclui todos (aprovados e inativos)
+      if (status === 'inativada' || status === 'inativo') {
+        inativas.push({ nome, cpf, conta });
+      }
+    }
+    return { map, inativas };
+  }
+
+  // Formato padrão Kesh Bank (xlsx)
   const cpfIdx = header.findIndex(h => h.includes('cpf'));
   const contaIdx = header.findIndex(h => h.includes('numero_conta') || h === 'conta');
-  if (cpfIdx === -1 || contaIdx === -1) return {};
+  if (cpfIdx === -1 || contaIdx === -1) return { map: {}, inativas: [] };
   const map = {};
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r[cpfIdx] || !r[contaIdx]) continue;
     map[parseCPF(r[cpfIdx])] = String(r[contaIdx]).trim();
   }
-  return map;
+  return { map, inativas: [] };
 }
 
 function parseVT(rows, contaMap) {
@@ -459,11 +488,25 @@ async function processFiles() {
 
   try {
     setProgress(10, 'Lendo base de contas...');
-    const bufContas = await readFile(contaFile);
-    const wbContas = XLSX.read(bufContas, {type:'array'});
-    const wsContas = wbContas.Sheets[wbContas.SheetNames[0]];
-    const rowsContas = XLSX.utils.sheet_to_json(wsContas, {header:1, defval:null});
-    const contaMap = buildContaMap(rowsContas);
+    let rowsContas;
+    if (contaFile.name.toLowerCase().endsWith('.csv')) {
+      // Parse CSV do sistema do cliente (separador ;)
+      const text = await new Promise((res,rej) => {
+        const r = new FileReader();
+        r.onload = e => res(e.target.result);
+        r.onerror = rej;
+        r.readAsText(contaFile, 'utf-8');
+      });
+      rowsContas = text.trim().split(/\r?\n/).map(line => line.split(';').map(v => v.trim()));
+    } else {
+      const bufContas = await readFile(contaFile);
+      const wbContas = XLSX.read(bufContas, {type:'array'});
+      const wsContas = wbContas.Sheets[wbContas.SheetNames[0]];
+      rowsContas = XLSX.utils.sheet_to_json(wsContas, {header:1, defval:null});
+    }
+    const contaResult = buildContaMap(rowsContas);
+    const contaMap = contaResult.map;
+    const contasInativas = contaResult.inativas || [];
 
     setProgress(25, 'Processando planilhas...');
     const outputs = [];
@@ -504,9 +547,19 @@ async function processFiles() {
     document.getElementById('s-total').textContent = fmtBRL(totalGeral);
     document.getElementById('s-sem-conta').textContent = totalSemConta;
 
-    if (totalSemConta > 0) {
+    if (totalSemConta > 0 || contasInativas.length > 0) {
       const wb2 = document.getElementById('warn-box');
-      wb2.textContent = '⚠ ' + totalSemConta + ' colaborador(es) sem conta na base — verifique antes de fazer o upload.';
+      let msg = '';
+      if (contasInativas.length > 0) {
+        msg += '⚠ ' + contasInativas.length + ' conta(s) INATIVADA(S) detectada(s) — o cliente precisa solicitar a reativação antes do upload:\n';
+        contasInativas.forEach(c => { msg += '  • ' + c.nome + ' (conta ' + c.conta + ')\n'; });
+        if (totalSemConta > 0) msg += '\n';
+      }
+      if (totalSemConta > 0) {
+        msg += '⚠ ' + totalSemConta + ' colaborador(es) sem conta na base — verifique antes de fazer o upload.';
+      }
+      wb2.style.whiteSpace = 'pre-line';
+      wb2.textContent = msg;
       wb2.classList.add('visible');
     }
 
@@ -553,17 +606,23 @@ async function processFiles() {
 
 function resetAll() {
   clientFiles = []; contaFile = null; allOutputs = [];
+  // Reset file inputs
   ['file-client','file-contas'].forEach(id => { const el = document.getElementById(id); if(el) el.value = ''; });
+  // Reset upload zones
   document.getElementById('zone-client').classList.remove('has-files');
   document.getElementById('zone-contas').classList.remove('has-files');
   document.getElementById('hint-client').textContent = 'Clique ou arraste · .xls/.xlsx';
-  document.getElementById('hint-contas').textContent = 'Clique para selecionar · .xlsx';
+  document.getElementById('hint-contas').textContent = 'Clique para selecionar · .xlsx ou .csv';
   document.getElementById('tags-client').innerHTML = '';
   document.getElementById('tags-contas').innerHTML = '';
+  // Reset empresa
   document.getElementById('empresa').value = '';
+  // Hide results / progress / messages
   document.getElementById('results').classList.remove('visible');
+  document.getElementById('progress-wrap').style.display = '';
   document.getElementById('error-box').textContent = '';
   document.getElementById('warn-box').textContent = '';
+  // Reset buttons
   document.getElementById('btn-run').disabled = true;
   document.getElementById('btn-reset').style.display = 'none';
 }
