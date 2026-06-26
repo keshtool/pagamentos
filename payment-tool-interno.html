@@ -308,18 +308,37 @@ function hideAll() {
   document.getElementById('warn-box').classList.remove('visible');
 }
 
+function normName(s) {
+  return String(s||'').trim().toLowerCase()
+    .normalize('NFD').replace(/[\u0300-\u036f]/g,'')
+    .replace(/\s+/g,' ');
+}
+
 function buildContaMap(rows) {
+  if (!rows || rows.length < 2) return { map: {}, nameMap: {}, inativas: [] };
   const header = (rows[0] || []).map(v => v ? String(v).toLowerCase().trim() : '');
-  const cpfIdx = header.findIndex(h => h.includes('cpf'));
-  const contaIdx = header.findIndex(h => h.includes('numero_conta') || h === 'conta');
-  if (cpfIdx === -1 || contaIdx === -1) return {};
-  const map = {};
+  const isSistema = header.some(h => h.includes('n\u00famero da conta') || h.includes('numero da conta'));
+  const cpfIdx    = header.findIndex(h => h.includes('cpf'));
+  const contaIdx  = isSistema
+    ? header.findIndex(h => h.includes('conta') && (h.includes('n\u00famero') || h.includes('numero')))
+    : header.findIndex(h => h.includes('numero_conta') || h === 'conta');
+  const salIdx    = header.findIndex(h => h === 'salario' || h === 'sal\u00e1rio' || h.includes('sal\u00e1rio'));
+  const statusIdx = header.findIndex(h => h.includes('paymentaccount') && !h.includes('criada'));
+  if (cpfIdx === -1 || contaIdx === -1) return { map: {}, nameMap: {}, inativas: [] };
+  const map = {}, nameMap = {}, inativas = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if (!r || !r[cpfIdx] || !r[contaIdx]) continue;
-    map[parseCPF(r[cpfIdx])] = String(r[contaIdx]).trim();
+    const cpf     = parseCPF(r[cpfIdx]);
+    const conta   = String(r[contaIdx]).trim();
+    const nome    = r[0] ? String(r[0]).trim() : '';
+    const salario = salIdx >= 0 && r[salIdx] != null ? r[salIdx] : null;
+    const status  = statusIdx >= 0 && r[statusIdx] ? String(r[statusIdx]).trim().toLowerCase() : 'aprovada';
+    map[cpf] = conta;
+    nameMap[normName(nome)] = { cpf, conta, salario };
+    if (status === 'inativada' || status === 'inativo') inativas.push({ nome, cpf, conta });
   }
-  return map;
+  return { map, nameMap, inativas };
 }
 
 function parseVT(rows, contaMap) {
@@ -341,7 +360,8 @@ function parseVT(rows, contaMap) {
   return groups;
 }
 
-function parseFerias(rows, contaMap) {
+function parseFerias(rows, contaMap, nameMap, valueMap) {
+  nameMap = nameMap || {};
   // Detecta formato: antigo (muitas colunas, "Serviço:") ou simplificado (3 colunas: nome/CPF/valor)
   const isFormatoAntigo = rows.some(r => r && r[1] && typeof r[1]==='string' && r[1].trim().startsWith('Serviço:'))
     || rows.some(r => r && typeof r[0]==='number' && Number.isInteger(r[0]) && r[0]>0);
@@ -364,6 +384,40 @@ function parseFerias(rows, contaMap) {
           && c15!=null && c24!=null && currentService) {
         const cpf = parseCPF(c15);
         groups[currentService].push({nome:c3.trim(), cpf, valor:fmtValor(c24), conta:contaMap[cpf]||''});
+      }
+    }
+    return groups;
+  }
+
+  // Detecta formato só-nomes (col1 sempre vazia — sem CPF, sem valor)
+  // Neste caso cruza por nome com a base de contas
+  const hasCPF = rows.some(r => r && String(r[1]||'').replace(/\D/g,'').length === 11);
+  if (!hasCPF && Object.keys(nameMap).length > 0) {
+    const groups = {};
+    let currentGroup = 'Férias';
+    const nonEmptyRows = rows.filter(r => r && r.some(c => c != null && c !== ''));
+    for (const r of nonEmptyRows) {
+      const c0 = String(r[0]||'').trim();
+      const c1 = r[1], c2 = r[2];
+      if (!c0) continue;
+      const key = normName(c0);
+      const found = nameMap[key];
+      if (found) {
+        // É colaborador — nome bate na base
+        if (!groups[currentGroup]) groups[currentGroup] = [];
+        let valor = '';
+        const cpfKey = found.cpf ? found.cpf.replace(/\D/g,'') : null;
+        if (valueMap && cpfKey && valueMap[cpfKey] != null && parseValor(valueMap[cpfKey]) > 0) {
+          valor = fmtValor(valueMap[cpfKey]);
+        } else if (valueMap && valueMap[key] != null && parseValor(valueMap[key]) > 0) {
+          valor = fmtValor(valueMap[key]);
+        } else if (found.salario != null && found.salario !== '' && parseValor(found.salario) > 0) {
+          valor = fmtValor(found.salario);
+        }
+        groups[currentGroup].push({nome: c0, cpf: found.cpf, valor, conta: found.conta});
+      } else if (!c1 && !c2) {
+        currentGroup = c0;
+        if (!groups[currentGroup]) groups[currentGroup] = [];
       }
     }
     return groups;
@@ -463,19 +517,56 @@ async function processFiles() {
     const wbContas = XLSX.read(bufContas, {type:'array'});
     const wsContas = wbContas.Sheets[wbContas.SheetNames[0]];
     const rowsContas = XLSX.utils.sheet_to_json(wsContas, {header:1, defval:null});
-    const contaMap = buildContaMap(rowsContas);
+    const contaResult = buildContaMap(rowsContas);
+    const contaMap  = contaResult.map;
+    const nameMap   = contaResult.nameMap || {};
+    const contasInativas = contaResult.inativas || [];
 
     setProgress(25, 'Processando planilhas...');
     const outputs = [];
 
+    // Passo 1: parseia todas as linhas e detecta formato
+    const allParsed = [];
     for (let fi = 0; fi < clientFiles.length; fi++) {
       const file = clientFiles[fi];
-      setProgress(25 + (fi / clientFiles.length) * 65, 'Processando: ' + file.name + '...');
-      const buf = await readFile(file);
+      setProgress(25 + (fi / clientFiles.length) * 30, 'Lendo: ' + file.name + '...');
+      let buf = await readFile(file);
+      if (file.name.toLowerCase().endsWith('.xls')) buf = repairXlsBoundsheet(buf);
       const wb = XLSX.read(buf, {type:'array'});
       const ws = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
-      const groups = tipo === 'vt' ? parseVT(rows, contaMap) : parseFerias(rows, contaMap);
+      const hasCPF = rows.some(r => r && String(r[1]||'').replace(/\D/g,'').length === 11);
+      const isAntigoFmt = rows.some(r => r && r[1] && typeof r[1]==='string' && r[1].trim().startsWith('Serviço:'))
+        || rows.some(r => r && typeof r[0]==='number' && Number.isInteger(r[0]) && r[0]>0);
+      const isNomesOnly = !hasCPF && !isAntigoFmt;
+      allParsed.push({file, rows, isNomesOnly});
+    }
+
+    // Passo 2: mapa global de valores a partir de arquivos com CPF+valor
+    const globalValueMap = {};
+    if (tipo !== 'vt') {
+      for (const {rows, isNomesOnly} of allParsed) {
+        if (!isNomesOnly) {
+          const g = parseFerias(rows, contaMap, nameMap, null);
+          for (const members of Object.values(g)) {
+            for (const m of members) {
+              const v = parseValor(m.valor);
+              if (v > 0) {
+                if (m.cpf) globalValueMap[m.cpf.replace(/\D/g,'')] = m.valor;
+                globalValueMap[normName(m.nome)] = m.valor;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Passo 3: gera outputs com cruzamento de valores
+    for (let fi = 0; fi < allParsed.length; fi++) {
+      const {file, rows} = allParsed[fi];
+      setProgress(55 + (fi / allParsed.length) * 40, 'Processando: ' + file.name + '...');
+
+      const groups = tipo === 'vt' ? parseVT(rows, contaMap) : parseFerias(rows, contaMap, nameMap, globalValueMap);
 
       for (const [groupName, members] of Object.entries(groups)) {
         if (members.length === 0) continue;
@@ -504,10 +595,26 @@ async function processFiles() {
     document.getElementById('s-total').textContent = fmtBRL(totalGeral);
     document.getElementById('s-sem-conta').textContent = totalSemConta;
 
-    if (totalSemConta > 0) {
+    const nomesOnlyZero = allParsed.filter(p => p.isNomesOnly).length;
+    const totalValorGeral = outputs.reduce((s,o) => s+o.totalValor, 0);
+    const hasValueFiles = allParsed.some(p => !p.isNomesOnly);
+
+    if (totalSemConta > 0 || (nomesOnlyZero > 0 && totalValorGeral === 0 && !hasValueFiles)) {
       const wb2 = document.getElementById('warn-box');
-      wb2.textContent = '⚠ ' + totalSemConta + ' colaborador(es) sem conta na base — verifique antes de fazer o upload.';
-      wb2.classList.add('visible');
+      let msg = '';
+      if (nomesOnlyZero > 0 && totalValorGeral === 0 && !hasValueFiles) {
+        msg += '⚠ Arquivo(s) LIDER contém apenas nomes sem valores de pagamento.\n';
+        msg += '   Para gerar os valores, adicione também o arquivo de valores (ex: Relatório de Líquidos) na mesma seleção de arquivos.\n';
+        msg += '   Ou preencha a coluna "Salario" na base de contas antes de processar.\n\n';
+      }
+      if (totalSemConta > 0) {
+        msg += '⚠ ' + totalSemConta + ' colaborador(es) sem conta na base — verifique antes de fazer o upload.';
+      }
+      if (msg.trim()) {
+        wb2.style.whiteSpace = 'pre-line';
+        wb2.textContent = msg;
+        wb2.classList.add('visible');
+      }
     }
 
     // File list
@@ -566,6 +673,88 @@ function resetAll() {
   document.getElementById('warn-box').textContent = '';
   document.getElementById('btn-run').disabled = true;
   document.getElementById('btn-reset').style.display = 'none';
+}
+
+
+// ── Repara XLS com BOUNDSHEET offset errado (OLE2 inconsistência) ─────────
+function repairXlsBoundsheet(arrayBuf) {
+  try {
+    const b = new Uint8Array(arrayBuf);
+    const dv = new DataView(arrayBuf);
+    // Verifica magic OLE2
+    if (b[0]!==0xD0||b[1]!==0xCF||b[2]!==0x11||b[3]!==0xE0) return arrayBuf;
+
+    const secSize = 1 << dv.getUint16(0x1E, true);
+
+    // Lê FAT (primeiro setor DIFAT)
+    const fatSec = dv.getUint32(0x4C, true);
+    if (fatSec >= 0xFFFFFFF8) return arrayBuf;
+    const fatLen = secSize / 4;
+    const fat = new Uint32Array(fatLen);
+    for (let i = 0; i < fatLen; i++)
+      fat[i] = dv.getUint32(512 + fatSec*secSize + i*4, true);
+
+    function chain(first) {
+      const c = []; let s = first;
+      while (s < 0xFFFFFFF8 && c.length < 1000) { c.push(s); s = fat[s]; }
+      return c;
+    }
+
+    // Lê diretório: entry 1 = Workbook
+    const dirSec = dv.getUint32(0x30, true);
+    const wbEntry = 1; // entry index
+    const eOff = 512 + dirSec*secSize + wbEntry*128;
+    if (eOff + 128 > b.length) return arrayBuf;
+    const wbFirst = dv.getUint32(eOff + 116, true);
+    const wbSize  = dv.getUint32(eOff + 120, true);
+    if (wbFirst >= 0xFFFFFFF8) return arrayBuf;
+
+    // Lê workbook stream
+    const wbChain = chain(wbFirst);
+    const wbBuf = new Uint8Array(wbChain.length * secSize);
+    wbChain.forEach((s,i) => wbBuf.set(b.subarray(512+s*secSize, 512+(s+1)*secSize), i*secSize));
+    const wbView = new DataView(wbBuf.buffer);
+    const wb = wbBuf.subarray(0, wbSize);
+
+    // Varre BIFF8: coleta BOUNDSHEET (0x0085) e BOF worksheet (0x0809, sub=0x0010)
+    const boundsheets = []; // {streamOff (offset do sheetPos), sheetPos}
+    const wsBOFs = [];      // posições no stream de cada BOF de worksheet
+    let p = 0;
+    while (p + 4 <= wbSize) {
+      const rt = (wb[p+1]<<8)|wb[p];
+      const rl = (wb[p+3]<<8)|wb[p+2];
+      if (rt === 0x0085 && rl >= 4) {
+        const sp = wbView.getUint32(p+4, true);
+        boundsheets.push({streamOff: p+4, sheetPos: sp});
+      }
+      if (rt === 0x0809 && rl >= 4) {
+        const sub = (wb[p+7]<<8)|wb[p+6];
+        if (sub === 0x0010) wsBOFs.push(p);
+      }
+      p += 4 + rl;
+    }
+
+    // Verifica se há divergência
+    let needsFix = false;
+    for (let i = 0; i < Math.min(boundsheets.length, wsBOFs.length); i++) {
+      if (boundsheets[i].sheetPos !== wsBOFs[i]) { needsFix = true; break; }
+    }
+    if (!needsFix) return arrayBuf;
+
+    // Cria cópia do buffer e aplica patches
+    const patched = arrayBuf.slice(0);
+    const pdv = new DataView(patched);
+    for (let i = 0; i < Math.min(boundsheets.length, wsBOFs.length); i++) {
+      const so = boundsheets[i].streamOff; // offset do campo sheetPos no stream
+      const sIdx = Math.floor(so / secSize);
+      const sOff = so % secSize;
+      if (sIdx < wbChain.length) {
+        const fileOff = 512 + wbChain[sIdx]*secSize + sOff;
+        pdv.setUint32(fileOff, wsBOFs[i], true);
+      }
+    }
+    return patched;
+  } catch(e) { return arrayBuf; }
 }
 
 </script>
